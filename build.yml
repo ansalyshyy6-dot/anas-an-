@@ -1,0 +1,93 @@
+name: Build APK from ZIP
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Unzip project
+        run: |
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::No .zip file found in the repository root"
+            exit 1
+          fi
+          mkdir -p work
+          unzip -q -o "${zips[0]}" -d work
+          settings=$(find work -not -path '*__MACOSX*' \( -name settings.gradle.kts -o -name settings.gradle \) | head -n1)
+          if [ -z "$settings" ]; then
+            echo "::error::No Android project (settings.gradle.kts) inside the zip"
+            exit 1
+          fi
+          echo "PROJECT_DIR=$(dirname "$settings")" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.7'
+          cache-disabled: true
+
+      - name: Build APKs (with retries)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          for i in 1 2 3 4; do
+            echo "=== Attempt $i ==="
+            if gradle :app:assembleDebug :app:assembleRelease --no-daemon; then
+              exit 0
+            fi
+            echo "Attempt $i failed, waiting before retry..."
+            sleep $((i*45))
+          done
+          exit 1
+
+      - name: Collect and verify APKs
+        run: |
+          mkdir -p out
+          cp "$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk" out/Sada-Walkie-debug.apk
+          cp "$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk" out/Sada-Walkie-release.apk
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          {
+            echo "## APK verification"
+            for f in out/*.apk; do
+              echo "### $f"
+              echo '```'
+              ls -l "$f"
+              "$BT/apksigner" verify --verbose --print-certs "$f" 2>&1 | head -15 || true
+              "$BT/aapt2" dump badging "$f" 2>&1 | grep -E "^package|sdkVersion|targetSdkVersion|debuggable|application-label:" | head -10 || true
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Sada-Walkie-APK
+          path: out/*.apk
+          if-no-files-found: error
+
+      - name: Publish release (direct APK download)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out/Sada-Walkie-release.apk out/Sada-Walkie-debug.apk \
+            --target "${{ github.sha }}" \
+            --title "Sada Walkie - build ${{ github.run_number }}" \
+            --notes "Try Sada-Walkie-release.apk first. If it fails to install, try Sada-Walkie-debug.apk."
